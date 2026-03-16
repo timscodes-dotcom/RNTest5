@@ -66,9 +66,9 @@ std::string writeDefaultWebRoot(const std::string& webRoot, const std::string& u
     </style>
 </head>
 <body>
-    <h2>文件上传</h2>
+    <h2>文件上传(200MB Maximum)</h2>
     <div class="tips">上传到 APP 目录，下载路径: /download?文件名</div>
-    <input id="f" type="file" />
+    <input id="f" type="file" accept="*/*" />
     <button onclick="upl()">上传</button>
     <div id="msg"></div>
     <script>
@@ -76,16 +76,32 @@ std::string writeDefaultWebRoot(const std::string& webRoot, const std::string& u
             const fi = document.getElementById('f');
             if (!fi.files || fi.files.length === 0) return;
             const file = fi.files[0];
-            const data = await file.arrayBuffer();
-            const bytes = new Uint8Array(data);
-            let binary = '';
-            for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-            const res = await fetch('/upload/' + encodeURIComponent(file.name) + '?msgid=0&idx=0', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/octet-stream'},
-                body: binary
-            });
-            document.getElementById('msg').innerText = await res.text();
+            const chunkSize = 512 * 1024; // 512KB
+            let offset = 0;
+            document.getElementById('msg').innerText = '上传开始...';
+
+            while (offset < file.size) {
+                const chunk = file.slice(offset, offset + chunkSize);
+                const res = await fetch('/upload/' + encodeURIComponent(file.name) +
+                    '?msgid=0&idx=0&offset=' + offset + '&total=' + file.size, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/octet-stream'},
+                    body: chunk
+                });
+
+                const text = await res.text();
+                const next = parseInt((text || '').trim(), 10);
+                if (!res.ok || !Number.isFinite(next) || next <= offset) {
+                    document.getElementById('msg').innerText = '上传失败: ' + text;
+                    return;
+                }
+
+                offset = next;
+                document.getElementById('msg').innerText =
+                    '上传中: ' + Math.min(100, Math.floor(offset * 100 / file.size)) + '%';
+            }
+
+            document.getElementById('msg').innerText = '上传完成: ' + file.name + ' (' + file.size + ' bytes)';
         }
     </script>
 </body>
@@ -351,6 +367,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_timscodes_fileshare_MyNativeModule
 
 std::string initFolders(const char * path)
 {
+    /*
 	std::string file = path;
   file += "/test.txt";
   FILE * fp = fopen(file.c_str(), "w");
@@ -363,6 +380,9 @@ std::string initFolders(const char * path)
   }
   
   if (ret != "") return ret;
+  */
+ std::string file = path;
+ std::string ret = "";
   
   //create files folder
   file = path;
@@ -389,6 +409,7 @@ std::string initFolders(const char * path)
   
   if (ret != "") return ret;
   
+  /*
   //test create file again
   file = path;
   file += "/files/test.txt";
@@ -399,7 +420,7 @@ std::string initFolders(const char * path)
   else {
     fclose(fp);
   }
-  
+  */
   return ret;
 }
 

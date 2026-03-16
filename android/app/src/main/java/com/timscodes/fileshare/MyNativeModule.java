@@ -16,6 +16,8 @@ import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 import com.facebook.react.uimanager.IllegalViewOperationException;
 import com.facebook.react.bridge.Callback;
@@ -39,6 +41,10 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 import java.io.IOException;
 import java.util.Map;
@@ -62,6 +68,7 @@ import android.provider.OpenableColumns;
 import android.Manifest;
 
 import android.provider.Settings;
+import androidx.documentfile.provider.DocumentFile;
 
 //import com.fxtf.gx.live.NotificationService;
 
@@ -70,10 +77,149 @@ public class MyNativeModule extends ReactContextBaseJavaModule {
 
   private static final String DURATION_SHORT_KEY = "SHORT";
   private static final String DURATION_LONG_KEY = "LONG";
+  private static final int REQUEST_CODE_PICK_FILE = 42001;
+    private static final int REQUEST_CODE_PICK_SAVE_DIR = 42002;
+
+  private Promise pendingPickFilePromise = null;
+  private String pendingPickTargetDir = null;
+    private boolean pendingPickMultiple = false;
+    private Promise pendingSaveDirPromise = null;
+    private String pendingSaveSourcePath = null;
+    private String pendingSaveSuggestedName = null;
+
+  private final ActivityEventListener mFilePickerListener = new BaseActivityEventListener() {
+      @Override
+      public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+          if (requestCode == REQUEST_CODE_PICK_SAVE_DIR) {
+              if (pendingSaveDirPromise == null) return;
+
+              Promise p = pendingSaveDirPromise;
+              String sourcePath = pendingSaveSourcePath;
+              String suggestedName = pendingSaveSuggestedName;
+              pendingSaveDirPromise = null;
+              pendingSaveSourcePath = null;
+              pendingSaveSuggestedName = null;
+
+              try {
+                  if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+                      p.resolve("{\"ret\":\"cancel\"}");
+                      return;
+                  }
+
+                  Uri treeUri = data.getData();
+                  final int takeFlags = data.getFlags() &
+                          (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                  try {
+                      getReactApplicationContext().getContentResolver().takePersistableUriPermission(treeUri, takeFlags);
+                  } catch (Exception ignored) {}
+
+                  DocumentFile tree = DocumentFile.fromTreeUri(getReactApplicationContext(), treeUri);
+                  if (tree == null || !tree.isDirectory() || !tree.canWrite()) {
+                      p.resolve("{\"ret\":\"dir_not_writable\"}");
+                      return;
+                  }
+
+                  String fileName = sanitizeFileName(suggestedName == null ? "saved_file" : suggestedName);
+                  DocumentFile outDoc = createUniqueDocumentFile(tree, fileName);
+                  if (outDoc == null) {
+                      p.resolve("{\"ret\":\"create_file_fail\"}");
+                      return;
+                  }
+
+                  long bytes = copyPathToUri(sourcePath, outDoc.getUri());
+                  JSONObject ret = new JSONObject();
+                  ret.put("ret", "ok");
+                  ret.put("name", outDoc.getName());
+                  ret.put("uri", outDoc.getUri().toString());
+                  ret.put("size", bytes);
+                  p.resolve(ret.toString());
+              } catch (Exception ex) {
+                  JSONObject err = new JSONObject();
+                  try {
+                      err.put("ret", "error");
+                      err.put("msg", ex.getMessage() == null ? "unknown" : ex.getMessage());
+                  } catch (Exception ignored) {}
+                  p.resolve(err.toString());
+              }
+              return;
+          }
+
+          if (requestCode != REQUEST_CODE_PICK_FILE) {
+              return;
+          }
+
+          if (pendingPickFilePromise == null) {
+              return;
+          }
+
+          Promise p = pendingPickFilePromise;
+          String targetDir = pendingPickTargetDir;
+          boolean isMultiple = pendingPickMultiple;
+          pendingPickFilePromise = null;
+          pendingPickTargetDir = null;
+          pendingPickMultiple = false;
+
+          try {
+              if (resultCode != Activity.RESULT_OK || data == null) {
+                  p.resolve("{\"ret\":\"cancel\"}");
+                  return;
+              }
+
+              File dir = new File(targetDir);
+              if (!dir.exists() && !dir.mkdirs()) {
+                  p.resolve("{\"ret\":\"mkdir_fail\"}");
+                  return;
+              }
+
+              if (isMultiple) {
+                  JSONArray files = new JSONArray();
+                  int imported = 0;
+
+                  if (data.getClipData() != null) {
+                      for (int i = 0; i < data.getClipData().getItemCount(); i++) {
+                          Uri uri = data.getClipData().getItemAt(i).getUri();
+                          if (uri == null) continue;
+                          JSONObject one = importOneUriToDir(uri, dir);
+                          files.put(one);
+                          if ("ok".equals(one.optString("ret"))) imported++;
+                      }
+                  } else if (data.getData() != null) {
+                      JSONObject one = importOneUriToDir(data.getData(), dir);
+                      files.put(one);
+                      if ("ok".equals(one.optString("ret"))) imported++;
+                  } else {
+                      p.resolve("{\"ret\":\"cancel\"}");
+                      return;
+                  }
+
+                  JSONObject ret = new JSONObject();
+                  ret.put("ret", imported > 0 ? "ok" : "error");
+                  ret.put("importedCount", imported);
+                  ret.put("files", files);
+                  p.resolve(ret.toString());
+              } else {
+                  if (data.getData() == null) {
+                      p.resolve("{\"ret\":\"cancel\"}");
+                      return;
+                  }
+                  JSONObject ret = importOneUriToDir(data.getData(), dir);
+                  p.resolve(ret.toString());
+              }
+          } catch (Exception ex) {
+              JSONObject err = new JSONObject();
+              try {
+                  err.put("ret", "error");
+                  err.put("msg", ex.getMessage() == null ? "unknown" : ex.getMessage());
+              } catch (Exception ignored) {}
+              p.resolve(err.toString());
+          }
+      }
+  };
 
   public MyNativeModule(ReactApplicationContext reactContext) {
     super(reactContext);
     mReactContext = reactContext;
+    mReactContext.addActivityEventListener(mFilePickerListener);
   }
 
   static {
@@ -264,6 +410,189 @@ public class MyNativeModule extends ReactContextBaseJavaModule {
             // Handle exceptions or print error messages
             ex.printStackTrace();
         }
+    }
+
+    @ReactMethod
+    public void pickAndImportFile(String uploadDir, Promise promise) {
+        pickAndImportFileInternal(uploadDir, false, promise);
+    }
+
+    @ReactMethod
+    public void pickAndImportFiles(String uploadDir, Promise promise) {
+        pickAndImportFileInternal(uploadDir, true, promise);
+    }
+
+    private void pickAndImportFileInternal(String uploadDir, boolean multiple, Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) {
+                promise.resolve("{\"ret\":\"no_activity\"}");
+                return;
+            }
+
+            if (uploadDir == null || uploadDir.trim().isEmpty()) {
+                promise.resolve("{\"ret\":\"invalid_upload_dir\"}");
+                return;
+            }
+
+            if (pendingPickFilePromise != null) {
+                promise.resolve("{\"ret\":\"busy\"}");
+                return;
+            }
+
+            pendingPickFilePromise = promise;
+            pendingPickTargetDir = uploadDir;
+            pendingPickMultiple = multiple;
+
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple);
+            activity.startActivityForResult(intent, REQUEST_CODE_PICK_FILE);
+        } catch (Exception ex) {
+            pendingPickFilePromise = null;
+            pendingPickTargetDir = null;
+            pendingPickMultiple = false;
+            promise.resolve("{\"ret\":\"error\",\"msg\":\"" + ex.getMessage() + "\"}");
+        }
+    }
+
+    private JSONObject importOneUriToDir(Uri uri, File dir) throws Exception {
+        String fileName = getFileName(getReactApplicationContext(), uri);
+        if (fileName == null || fileName.trim().isEmpty()) {
+            fileName = "imported_file";
+        }
+        fileName = sanitizeFileName(fileName);
+
+        File outFile = buildUniqueFile(dir, fileName);
+        long bytes = copyUriToFile(uri, outFile);
+
+        JSONObject ret = new JSONObject();
+        ret.put("ret", "ok");
+        ret.put("name", outFile.getName());
+        ret.put("path", outFile.getAbsolutePath());
+        ret.put("size", bytes);
+        return ret;
+    }
+
+    private String sanitizeFileName(String name) {
+        String clean = name.replaceAll("[\\\\/:*?\"<>|\\u0000-\\u001f]", "_").trim();
+        if (clean.isEmpty()) {
+            clean = "imported_file";
+        }
+        return clean;
+    }
+
+    private File buildUniqueFile(File dir, String fileName) {
+        File out = new File(dir, fileName);
+        if (!out.exists()) return out;
+
+        int dot = fileName.lastIndexOf('.');
+        String base = dot > 0 ? fileName.substring(0, dot) : fileName;
+        String ext = dot > 0 ? fileName.substring(dot) : "";
+
+        int idx = 1;
+        while (out.exists()) {
+            out = new File(dir, base + "_" + idx + ext);
+            idx++;
+        }
+        return out;
+    }
+
+    private long copyUriToFile(Uri uri, File outFile) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+
+        try (InputStream in = getReactApplicationContext().getContentResolver().openInputStream(uri);
+             OutputStream out = new FileOutputStream(outFile, false)) {
+            if (in == null) {
+                throw new IOException("openInputStream null");
+            }
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+                total += read;
+            }
+            out.flush();
+        }
+
+        return total;
+    }
+
+    @ReactMethod
+    public void saveAsToPickedDirectory(String sourcePath, String suggestedName, Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) {
+                promise.resolve("{\"ret\":\"no_activity\"}");
+                return;
+            }
+            if (sourcePath == null || sourcePath.trim().isEmpty()) {
+                promise.resolve("{\"ret\":\"invalid_source\"}");
+                return;
+            }
+            File src = new File(sourcePath);
+            if (!src.exists() || !src.isFile()) {
+                promise.resolve("{\"ret\":\"source_not_found\"}");
+                return;
+            }
+            if (pendingSaveDirPromise != null || pendingPickFilePromise != null) {
+                promise.resolve("{\"ret\":\"busy\"}");
+                return;
+            }
+
+            pendingSaveDirPromise = promise;
+            pendingSaveSourcePath = sourcePath;
+            pendingSaveSuggestedName = suggestedName;
+
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            activity.startActivityForResult(intent, REQUEST_CODE_PICK_SAVE_DIR);
+        } catch (Exception ex) {
+            pendingSaveDirPromise = null;
+            pendingSaveSourcePath = null;
+            pendingSaveSuggestedName = null;
+            promise.resolve("{\"ret\":\"error\",\"msg\":\"" + ex.getMessage() + "\"}");
+        }
+    }
+
+    private DocumentFile createUniqueDocumentFile(DocumentFile dir, String fileName) {
+        String base = fileName;
+        String ext = "";
+        int dot = fileName.lastIndexOf('.');
+        if (dot > 0) {
+            base = fileName.substring(0, dot);
+            ext = fileName.substring(dot);
+        }
+
+        String candidate = fileName;
+        int idx = 1;
+        while (dir.findFile(candidate) != null) {
+            candidate = base + "_" + idx + ext;
+            idx++;
+        }
+
+        return dir.createFile("application/octet-stream", candidate);
+    }
+
+    private long copyPathToUri(String sourcePath, Uri outUri) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        try (InputStream in = new FileInputStream(new File(sourcePath));
+             OutputStream out = getReactApplicationContext().getContentResolver().openOutputStream(outUri, "w")) {
+            if (out == null) {
+                throw new IOException("openOutputStream null");
+            }
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+                total += read;
+            }
+            out.flush();
+        }
+        return total;
     }
 /*
     //https://medium.com/@daneallist/implement-qr-code-scanning-from-an-image-in-react-native-0cd12fdaa14e

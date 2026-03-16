@@ -41,6 +41,10 @@ target_compile_options(sqlite3 PRIVATE -Wno-unused-variable -Wno-unused-paramete
 add_library(mongoose STATIC mongoose/mongoose.c)
 set_target_properties(mongoose PROPERTIES LINKER_LANGUAGE C)
 target_compile_options(mongoose PRIVATE -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function)
+target_compile_definitions(mongoose PRIVATE MG_MAX_RECV_SIZE=209715200UL)
+
+# Android log library for __android_log_print
+find_library(log-lib log)
 
 # Add all source files to the main appmodules library
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
@@ -63,6 +67,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     native-lib.cpp
 )
 
+# Keep the same mongoose receive-size limit visible to C++ translation units
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MG_MAX_RECV_SIZE=20971520UL)
+
 # Link the SQLite library
 target_link_libraries(${CMAKE_PROJECT_NAME} sqlite3)
 target_link_libraries(${CMAKE_PROJECT_NAME} mongoose)
+target_link_libraries(${CMAKE_PROJECT_NAME} ${log-lib})

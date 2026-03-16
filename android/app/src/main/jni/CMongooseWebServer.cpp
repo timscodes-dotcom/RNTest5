@@ -9,6 +9,11 @@
 #include <sstream>
 #include <iomanip>
 
+#include <android/log.h>
+#define MWS_LOG_TAG "MyNative"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, MWS_LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, MWS_LOG_TAG, __VA_ARGS__)
+
 std::string decodeUrl(const std::string& url) {
     std::string decoded;
     std::istringstream urlStream(url);
@@ -68,6 +73,20 @@ struct upload_state {
     void* fp;         // Opened uploaded file
 };
 
+size_t get_content_length(struct mg_http_message* hm) {
+    struct mg_str* h = mg_http_get_header(hm, "Content-Length");
+    if (h == NULL || h->len == 0) return 0;
+    size_t v = 0;
+    for (size_t i = 0; i < h->len; ++i) {
+        char ch = h->buf[i];
+        if (ch < '0' || ch > '9') return 0;
+        size_t digit = (size_t)(ch - '0');
+        if (v > (SIZE_MAX - digit) / 10) return 0;  // overflow
+        v = v * 10 + digit;
+    }
+    return v;
+}
+
 std::string get_mg_str(struct mg_str& src) {
     return std::string(src.buf, src.len);
 }
@@ -81,124 +100,138 @@ std::string CMongooseWebServer::formatUploadFileName(std::string query, std::str
 
     char fpath[MG_PATH_MAX];
     //msgId = atoi(params["msgid"].c_str());
-    snprintf(fpath, MG_PATH_MAX, "%s%cmsg%s_%s_%s", s_upld_dir.c_str(), MG_DIRSEP, params["msgid"].c_str(), randStr, apiName.c_str());
+    //snprintf(fpath, MG_PATH_MAX, "%s%cmsg%s_%s_%s", s_upld_dir.c_str(), MG_DIRSEP, params["msgid"].c_str(), randStr, apiName.c_str());
+    snprintf(fpath, MG_PATH_MAX, "%s%c%s", s_upld_dir.c_str(), MG_DIRSEP, apiName.c_str());
     return std::string(fpath);
 }
 
 void CMongooseWebServer::handle_uploads(struct mg_connection* c, int ev, void* ev_data) {
-    struct upload_state* us = (struct upload_state*)c->data;
+    if (ev != MG_EV_HTTP_MSG) return;
+
     struct mg_fs* fs = &mg_fs_posix;
+    struct mg_http_message* hm = (struct mg_http_message*)ev_data;
+    if (!mg_match(hm->uri, mg_str("/upload/#"), NULL)) return;
 
-    // Catch /upload requests early, without buffering whole body
-    // When we receive MG_EV_HTTP_HDRS event, that means we've received all
-    // HTTP headers but not necessarily full HTTP body
-    if (ev == MG_EV_HTTP_HDRS) {
-        struct mg_http_message* hm = (struct mg_http_message*)ev_data;
-        if (mg_match(hm->uri, mg_str("/upload/#"), NULL)) {
-            MG_INFO(("######### upload parameters: %s\n", get_mg_str(hm->query).c_str()));
-            c->pfn = NULL;  // Silence HTTP protocol handler, we'll take over
-            if (!authuser(hm)) {
-                mg_http_reply(c, 403, "", "Denied\n");
-                c->is_draining = 1;  // Tell mongoose to close this connection
-            }
-            else if (hm->body.len > (size_t)s_max_size) {
-                mg_http_reply(c, 400, "", "Too long\n");
-                c->is_draining = 1;           // Tell mongoose to close this connection
-            }
-            else if (hm->uri.len == 8) {  // 8: /upload/
-                mg_http_reply(c, 400, "", "Name required\n");
-                c->is_draining = 1;  // Tell mongoose to close this connection
-            }
-            else if (s_upld_dir.length() + (hm->uri.len - 8) + 2 >
-                MG_PATH_MAX) {  // 2: MG_DIRSEP + NUL
-                mg_http_reply(c, 400, "", "Path is too long\n");
-                c->is_draining = 1;  // Tell mongoose to close this connection
-            }
-            else {
-                //char fpath[MG_PATH_MAX];
-                //snprintf(fpath, MG_PATH_MAX, "%s%c", s_upld_dir.c_str(), MG_DIRSEP);
-                //strncat(fpath, hm->uri.buf + 8, hm->uri.len - 8);
-                int msgId = 0;
-                std::unordered_map<std::string, std::string> params;
-                parseUrlParams(decodeUrl(get_mg_str(hm->query)), params);
-                std::string oriFileName = decodeUrl(std::string(hm->uri.buf + 8, hm->uri.len - 8));
-                if (oriFileName.find("{") != std::string::npos) {
-                    if (m_pEventHandler && on_event) {
-                        on_event(m_pEventHandler, "uploadName", (void*)hm, oriFileName);
-                        if (oriFileName == "") {
-                            mg_http_reply(c, 400, "", "Name invalid\n");
-                            c->is_draining = 1;  // Tell mongoose to close this connection
-                        }
-                    }
-                }
-                std::string fpath = formatUploadFileName( decodeUrl(get_mg_str(hm->query)), oriFileName, params);
-                if (!mg_path_is_sane(mg_str(fpath.c_str()))) {
-                    mg_http_reply(c, 400, "", "Invalid path\n");
-                    c->is_draining = 1;  // Tell mongoose to close this connection
-                }
-                else {
-                    struct mg_fd* fd;
-                    MG_DEBUG(("Got request"));
-                    fs->rm(fpath.c_str());  // Delete file if it exists
-                    if ((fd = (struct mg_fd*)fs->op(fpath.c_str(), MG_FS_WRITE)) == NULL) {
-                        mg_http_reply(c, 400, "", "open failed: %d\n", errno);
-                        c->is_draining = 1;  // Tell mongoose to close this connection
-                    }
-                    else {
-                        us->fp = fd;
-                        us->expected = hm->body.len;  // Store number of bytes we expect
+    size_t contentLen = hm->body.len;
+    LOGI("upload parameters: %s, body len: %zu", get_mg_str(hm->query).c_str(), contentLen);
 
-                        struct upload_file_info* uploading = new struct upload_file_info;
-                        strncpy(uploading->oriFileName, oriFileName.c_str(), MG_PATH_MAX);
-                        strncpy(uploading->fileName, fpath.c_str(), MG_PATH_MAX);
-                        uploading->msgId = atoi(params["msgid"].c_str());
-                        uploading->idx = atoi(params["idx"].c_str());
-                        uint64_t ptrAs64BitInt = static_cast<uint64_t>(reinterpret_cast<uintptr_t>((void*)fd));
-                        m_lock.lock();
-                        m_uploading[ptrAs64BitInt] = uploading;
-                        m_lock.unlock();
+    if (!authuser(hm)) {
+        mg_http_reply(c, 403, "", "Denied\n");
+        c->is_draining = 1;
+        return;
+    }
+    if (contentLen == 0) {
+        mg_http_reply(c, 400, "", "Empty body\n");
+        c->is_draining = 1;
+        return;
+    }
+    if (contentLen > (size_t)s_max_size) {
+        mg_http_reply(c, 400, "", "Too long\n");
+        c->is_draining = 1;
+        return;
+    }
 
-                        mg_iobuf_del(&c->recv, 0, hm->head.len);  // Delete HTTP headers
-                    }
-                }
-            }
+    std::unordered_map<std::string, std::string> params;
+    parseUrlParams(decodeUrl(get_mg_str(hm->query)), params);
+
+    long long offset = 0;
+    bool hasOffset = false;
+    if (params.find("offset") != params.end()) {
+        hasOffset = true;
+        offset = atoll(params["offset"].c_str());
+        if (offset < 0) {
+            mg_http_reply(c, 400, "", "Invalid offset\n");
+            c->is_draining = 1;
+            return;
         }
     }
 
-    // Catch uploaded file data for both MG_EV_READ and MG_EV_HTTP_HDRS
-    if (us->expected > 0 && c->recv.len > 0) {
-        us->received += c->recv.len;
-        MG_DEBUG(("Got chunk: %lu bytes, %lu so far, %lu total", c->recv.len,
-            us->received, us->expected));
-        if (us->fp) fs->wr(us->fp, c->recv.buf, c->recv.len);  // Write to file
-        c->recv.len = 0;  // Delete received data
-        if (us->received >= us->expected) {
-            // Uploaded everything. Send response back
-            MG_INFO(("Uploaded %lu bytes", us->received));
-            mg_http_reply(c, 200, NULL, "%lu ok\n", us->received);
-
-            struct upload_file_info* uploading = nullptr;
-            uint64_t ptrAs64BitInt = static_cast<uint64_t>(reinterpret_cast<uintptr_t>((void*)(us->fp)));
-            m_lock.lock();
-            auto it = m_uploading.find(ptrAs64BitInt);
-            if (it != m_uploading.end()) uploading = it->second;
-            m_lock.unlock();
-
-            if (us->fp) fs->cl(us->fp);  // Close file
-            memset(us, 0, sizeof(*us));  // Cleanup upload state
-            c->is_draining = 1;          // Close connection when response gets sent
-            if (m_pEventHandler && on_event) {
-                std::string apiRet = "ok";
-                if (uploading) {
-                    on_event(m_pEventHandler, "upload", uploading, apiRet);
-
-                    m_lock.lock();
-                    delete uploading;
-                    m_uploading.erase(it);
-                    m_lock.unlock();
-                }
-            }
+    long long totalSize = 0;
+    bool hasTotal = false;
+    if (params.find("total") != params.end()) {
+        hasTotal = true;
+        totalSize = atoll(params["total"].c_str());
+        if (totalSize <= 0) {
+            mg_http_reply(c, 400, "", "Invalid total\n");
+            c->is_draining = 1;
+            return;
         }
+        if ((size_t) totalSize > (size_t) s_max_size) {
+            mg_http_reply(c, 400, "", "Too long\n");
+            c->is_draining = 1;
+            return;
+        }
+    }
+
+    std::string oriFileName = decodeUrl(std::string(hm->uri.buf + 8, hm->uri.len - 8));
+    if (oriFileName.empty()) {
+        mg_http_reply(c, 400, "", "Name required\n");
+        c->is_draining = 1;
+        return;
+    }
+    if (oriFileName.find("{") != std::string::npos && m_pEventHandler && on_event) {
+        on_event(m_pEventHandler, "uploadName", (void*)hm, oriFileName);
+        if (oriFileName.empty()) {
+            mg_http_reply(c, 400, "", "Name invalid\n");
+            c->is_draining = 1;
+            return;
+        }
+    }
+
+    std::string fpath = formatUploadFileName(decodeUrl(get_mg_str(hm->query)), oriFileName, params);
+    if (!mg_path_is_sane(mg_str(fpath.c_str()))) {
+        mg_http_reply(c, 400, "", "Invalid path\n");
+        c->is_draining = 1;
+        return;
+    }
+
+    if (hasOffset) {
+        size_t currentSize = 0;
+        fs->st(fpath.c_str(), &currentSize, NULL);
+        if (offset == 0) {
+            fs->rm(fpath.c_str());
+        } else if ((size_t) offset != currentSize) {
+            mg_http_reply(c, 409, "", "offset mismatch: expect %lu got %lld\n", (unsigned long) currentSize, offset);
+            c->is_draining = 1;
+            return;
+        }
+    } else {
+        fs->rm(fpath.c_str());
+    }
+
+    void* fd = fs->op(fpath.c_str(), MG_FS_WRITE);
+    if (fd == NULL) {
+        mg_http_reply(c, 400, "", "open failed: %d\n", errno);
+        c->is_draining = 1;
+        return;
+    }
+
+    size_t written = fs->wr(fd, hm->body.buf, hm->body.len);
+    fs->cl(fd);
+    if (written != hm->body.len) {
+        mg_http_reply(c, 500, "", "write failed\n");
+        c->is_draining = 1;
+        return;
+    }
+
+    LOGI("Uploaded %lu bytes to %s", (unsigned long) written, fpath.c_str());
+    size_t nextOffset = hasOffset ? ((size_t) offset + written) : written;
+    mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "%lu", (unsigned long) nextOffset);
+    c->is_draining = 1;
+
+    bool completed = true;
+    if (hasTotal) {
+        completed = (long long) nextOffset >= totalSize;
+    }
+
+    if (completed && m_pEventHandler && on_event) {
+        struct upload_file_info uploading;
+        snprintf(uploading.oriFileName, MG_PATH_MAX, "%s", oriFileName.c_str());
+        snprintf(uploading.fileName, MG_PATH_MAX, "%s", fpath.c_str());
+        uploading.msgId = atoi(params["msgid"].c_str());
+        uploading.idx = atoi(params["idx"].c_str());
+        std::string apiRet = "ok";
+        on_event(m_pEventHandler, "upload", &uploading, apiRet);
     }
 }
 
@@ -275,10 +308,7 @@ void CMongooseWebServer::cb(struct mg_connection* c, int ev, void* ev_data) {
         mg_tls_init(c, &opts);
     }
 
-    if (ev == MG_EV_READ || ev == MG_EV_HTTP_HDRS) {
-        server->handle_uploads(c, ev, ev_data);
-    }
-    else if (ev == MG_EV_HTTP_MSG) {
+    if (ev == MG_EV_HTTP_MSG) {
         // Non-upload requests, we serve normally
         // NOTE: handle_uploads() may delete request and reset c->pfn
         /*
@@ -296,10 +326,13 @@ void CMongooseWebServer::cb(struct mg_connection* c, int ev, void* ev_data) {
         MG_INFO(("######### uri: %s\n", uri.c_str()));
         MG_INFO(("######### query: %s\n", get_mg_str(hm->query).c_str()));
         MG_INFO(("######### proto: %s\n", get_mg_str(hm->proto).c_str()));
-        MG_INFO(("######### body: %s\n", get_mg_str(hm->body).c_str()));
+        MG_INFO(("######### body len: %lu\n", (unsigned long) hm->body.len));
         //MG_INFO(("######### head: %s\n", get_mg_str(hm->head).c_str()));
         //MG_INFO(("######### message: %s\n", get_mg_str(hm->message).c_str()));
-        if (mg_match(hm->uri, mg_str("/api"), NULL))
+        if (mg_match(hm->uri, mg_str("/upload/#"), NULL)) {
+            server->handle_uploads(c, ev, ev_data);
+        }
+        else if (mg_match(hm->uri, mg_str("/api"), NULL))
         {
             std::string apiRet = "ok";
             server->handle_api(hm, apiRet);
@@ -336,7 +369,7 @@ void CMongooseWebServer::threadFunc() {
     MG_INFO(("Web root         : [%s]", s_root_dir.c_str()));
     MG_INFO(("Uploading to     : [%s]", s_upld_dir.c_str()));
     s_signo = 0;
-    while (s_signo == 0) mg_mgr_poll(&mgr, 300);
+    while (s_signo == 0) mg_mgr_poll(&mgr, 10);
     mg_mgr_free(&mgr);
     MG_INFO(("Exiting on signal %d", s_signo));
 }
